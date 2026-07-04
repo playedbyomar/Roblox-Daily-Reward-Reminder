@@ -1,0 +1,28 @@
+name: Daily Reward Reminder Worker
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub's free tier recommends nothing tighter
+    # than this for public repos, and it's more than precise enough
+    # for a 24-hour reminder.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {} # lets you trigger it manually from the Actions tab to test
+
+jobs:
+  check-reminders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run reminder worker
+        env:
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          UNIVERSE_ID: "6033574667"
+          NOTIFICATION_ASSET_ID: "7f7141f1-d906-504e-85f5-e235b5b91f25"
+        run: node reminder-worker.js
