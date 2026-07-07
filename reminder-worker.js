@@ -45,6 +45,7 @@ async function getDueEntries() {
 		}
 		const body = await res.json();
 		const entries = body.entries || [];
+		console.log(`Page returned ${entries.length} total entries:`, entries.map(e => ({ id: e.id, value: e.value })));
 
 		for (const entry of entries) {
 			const value = Number(entry.value);
