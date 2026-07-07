@@ -1,119 +1,137 @@
 // reminder-worker.js
-// Checks the "ReminderQueue_v1" OrderedDataStore for players whose 24h
-// daily-reward cooldown has just expired, and sends them an Experience
-// Notification via Open Cloud. Designed to be run on a schedule
-// (GitHub Actions, every ~15 minutes) — not as a long-running process.
+// Drains ReminderQueue_v1 (Ordered Data Store) and fires "come back" Experience
+// Notifications for every entry that is due (value <= now).
 
-const UNIVERSE_ID = process.env.UNIVERSE_ID;
-const NOTIFICATION_ASSET_ID = process.env.NOTIFICATION_ASSET_ID;
-const API_KEY = process.env.ROBLOX_API_KEY;
+const API_KEY     = process.env.ROBLOX_API_KEY;
+const UNIVERSE_ID = process.env.UNIVERSE_ID || "6033574667";
+const ODS_NAME    = process.env.ODS_NAME    || "ReminderQueue_v1";
+const MESSAGE_ID  = process.env.MESSAGE_ID  || "7f7141f1-d906-504e-85f5-e235b5b91f25";
 
-const BASE_URL = "https://apis.roblox.com/cloud/v2";
-const ORDERED_STORE_ID = "ReminderQueue_v1";
-const SCOPE = "global";
+const PAGE_SIZE     = 100;   // entries per list page
+const MAX_PER_RUN   = 200;   // safety cap so one run can't blast thousands (backlog drains over subsequent runs)
+const SEND_DELAY_MS = 150;   // gentle spacing between notification sends
 
-if (!UNIVERSE_ID || !NOTIFICATION_ASSET_ID || !API_KEY) {
-	console.error("Missing required env vars: UNIVERSE_ID, NOTIFICATION_ASSET_ID, ROBLOX_API_KEY");
-	process.exit(1);
+const ODS_BASE = "https://apis.roblox.com/ordered-data-stores/v1";
+
+if (!API_KEY) {
+  console.error("ROBLOX_API_KEY is not set");
+  process.exit(1);
 }
 
-function headers() {
-	return { "x-api-key": API_KEY, "Content-Type": "application/json" };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---------------------------------------------------------------------------
+// List due entries. Ascending by value means due entries come first, so we can
+// stop the moment we hit one in the future. THROWS on any non-2xx so a bad
+// request (e.g. the old order_by=value 400) can never masquerade as "empty".
+// ---------------------------------------------------------------------------
+async function fetchDueEntries(now) {
+  const due = [];
+  let pageToken = null;
+
+  while (due.length < MAX_PER_RUN) {
+    const url = new URL(
+      `${ODS_BASE}/universes/${UNIVERSE_ID}/orderedDataStores/${ODS_NAME}/scopes/global/entries`
+    );
+    url.searchParams.set("max_page_size", String(PAGE_SIZE));
+    url.searchParams.set("order_by", "asc"); // <-- this endpoint wants asc/desc, NOT "value"
+    if (pageToken) url.searchParams.set("page_token", pageToken);
+
+    const res = await fetch(url, { headers: { "x-api-key": API_KEY } });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`List failed: HTTP ${res.status} ${body}`);
+    }
+
+    const data = await res.json();
+    const entries = data.entries || [];
+    if (entries.length === 0) break; // empty page -> nothing more to do
+
+    for (const e of entries) {
+      const value = parseInt(e.value, 10); // value comes back as a STRING
+      if (Number.isNaN(value)) continue;
+      if (value <= now) {
+        due.push(e); // { path, id, value }
+      } else {
+        return due; // ascending order -> everything after this is in the future
+      }
+      if (due.length >= MAX_PER_RUN) break;
+    }
+
+    pageToken = data.nextPageToken;
+    if (!pageToken) break;
+  }
+
+  return due;
 }
 
-// Pull entries sorted ascending by due-time (the value we stored),
-// so the earliest-due players show up first. We page through and stop
-// once we reach an entry that isn't due yet (everything after it in
-// ascending order won't be due either).
-async function getDueEntries() {
-	const now = Math.floor(Date.now() / 1000);
-	const due = [];
-	let pageToken = "";
+// ---------------------------------------------------------------------------
+// Send one notification. Returns "sent" | "skip" | "ratelimited".
+// The key id is "u<userId>" -> strip the "u" for the users/{id} endpoint.
+// ---------------------------------------------------------------------------
+async function sendNotification(entryId) {
+  const userId = entryId.replace(/^u/, "");
+  const res = await fetch(
+    `https://apis.roblox.com/cloud/v2/users/${userId}/notifications`,
+    {
+      method: "POST",
+      headers: { "x-api-key": API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: { universe: `universes/${UNIVERSE_ID}` },
+        payload: { type: "MOMENT", messageId: MESSAGE_ID },
+      }),
+    }
+  );
 
-	do {
-		const url = new URL(
-			`${BASE_URL}/universes/${UNIVERSE_ID}/ordered-data-stores/${ORDERED_STORE_ID}/scopes/${SCOPE}/entries`
-		);
-		url.searchParams.set("max_page_size", "100");
-		url.searchParams.set("order_by", "value");
-		if (pageToken) url.searchParams.set("page_token", pageToken);
-
-		const res = await fetch(url, { headers: headers() });
-		if (!res.ok) {
-			console.error("Failed to list entries:", res.status, await res.text());
-			break;
-		}
-		const body = await res.json();
-		const entries = body.entries || [];
-		console.log(`Page returned ${entries.length} total entries:`, entries.map(e => ({ id: e.id, value: e.value })));
-
-		for (const entry of entries) {
-			const value = Number(entry.value);
-			if (value <= now) {
-				due.push(entry);
-			} else {
-				// Ascending order: nothing further in this page (or later
-				// pages) can be due yet either. Stop entirely.
-				pageToken = null;
-				break;
-			}
-		}
-
-		pageToken = pageToken === null ? null : body.nextPageToken || null;
-	} while (pageToken);
-
-	return due;
+  if (res.status === 429) return "ratelimited";
+  if (!res.ok) {
+    // 400/403/404 are expected for users who opted out / can't be prompted.
+    // Nothing to retry, so we still delete the queue entry afterwards.
+    const body = await res.text();
+    console.warn(`send ${userId}: HTTP ${res.status} ${body}`);
+    return "skip";
+  }
+  return "sent";
 }
 
-async function sendReminder(userId) {
-	const res = await fetch(`https://apis.roblox.com/cloud/v2/users/${userId}/notifications`, {
-		method: "POST",
-		headers: headers(),
-		body: JSON.stringify({
-			source: { universe: `universes/${UNIVERSE_ID}` },
-			payload: { message_id: NOTIFICATION_ASSET_ID, type: "MOMENT" },
-		}),
-	});
-	if (!res.ok) {
-		console.warn(`Notification send failed for user ${userId}:`, res.status, await res.text());
-	}
-	return res.ok;
+// entry.path is the full resource path the API handed us -> delete straight off it.
+async function deleteEntry(path) {
+  const res = await fetch(`${ODS_BASE}/${path}`, {
+    method: "DELETE",
+    headers: { "x-api-key": API_KEY },
+  });
+  if (!res.ok && res.status !== 404) {
+    const body = await res.text();
+    console.warn(`delete ${path}: HTTP ${res.status} ${body}`);
+  }
 }
 
-async function deleteEntry(entryId) {
-	// entryId as returned by List Entries may look like "global/u123..." —
-	// use it exactly as returned rather than reconstructing it.
-	const url = `${BASE_URL}/universes/${UNIVERSE_ID}/ordered-data-stores/${ORDERED_STORE_ID}/scopes/${SCOPE}/entries/${encodeURIComponent(
-		entryId.split("/").pop()
-	)}`;
-	const res = await fetch(url, { method: "DELETE", headers: headers() });
-	if (!res.ok) {
-		console.warn(`Failed to delete queue entry ${entryId}:`, res.status, await res.text());
-	}
-}
-
+// ---------------------------------------------------------------------------
 async function main() {
-	const due = await getDueEntries();
-	console.log(`Found ${due.length} due reminder(s).`);
+  const now = Math.floor(Date.now() / 1000); // Unix SECONDS (queue stores seconds)
+  const due = await fetchDueEntries(now);
+  console.log(`Found ${due.length} due ent(y/ies) at ${now}`);
 
-	for (const entry of due) {
-		const rawId = entry.id.split("/").pop(); // e.g. "u12345678"
-		const userId = rawId.replace(/^u/, "");
+  let sent = 0, skipped = 0;
+  for (const e of due) {
+    const result = await sendNotification(e.id);
 
-		try {
-			const sent = await sendReminder(userId);
-			console.log(`User ${userId}: ${sent ? "sent" : "attempted (may not be opted in)"}`);
-		} catch (err) {
-			console.error(`Error sending to user ${userId}:`, err);
-		} finally {
-			// Always clear the entry so we never re-notify for the same claim,
-			// regardless of whether delivery actually happened (we can't know).
-			await deleteEntry(entry.id);
-		}
-	}
+    if (result === "ratelimited") {
+      // Back off: leave this entry (and the rest) for the next cron run.
+      console.warn("Rate limited -> stopping this run, entry left in queue for retry.");
+      break;
+    }
+
+    await deleteEntry(e.path); // sent or skip -> drain it either way
+    if (result === "sent") sent++; else skipped++;
+
+    await sleep(SEND_DELAY_MS);
+  }
+
+  console.log(`Done. sent=${sent} skipped=${skipped} remaining_in_batch=${due.length - sent - skipped}`);
 }
 
 main().catch((err) => {
-	console.error("Worker failed:", err);
-	process.exit(1);
+  console.error(err);
+  process.exit(1); // fail loudly -> GitHub Actions marks the run red
 });
