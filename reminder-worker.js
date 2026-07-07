@@ -35,7 +35,7 @@ async function getDueEntries() {
 			`${BASE_URL}/universes/${UNIVERSE_ID}/ordered-data-stores/${ORDERED_STORE_ID}/scopes/${SCOPE}/entries`
 		);
 		url.searchParams.set("max_page_size", "100");
-		url.searchParams.set("order_by", "asc");
+		url.searchParams.set("order_by", "value");
 		if (pageToken) url.searchParams.set("page_token", pageToken);
 
 		const res = await fetch(url, { headers: headers() });
