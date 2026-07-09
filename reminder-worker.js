@@ -1,15 +1,15 @@
 // reminder-worker.js
-// Drains ReminderQueue_v1 (Ordered Data Store) and fires "come back" Experience
-// Notifications for every entry that is due (value <= now).
+// Drains ReminderQueue_v1 (Ordered Data Store) and fires "come back"
+// Experience Notifications for every entry that is due (value <= now).
 
 const API_KEY     = process.env.ROBLOX_API_KEY;
 const UNIVERSE_ID = process.env.UNIVERSE_ID || "6033574667";
 const ODS_NAME    = process.env.ODS_NAME    || "ReminderQueue_v1";
 const MESSAGE_ID  = process.env.MESSAGE_ID  || "7f7141f1-d906-504e-85f5-e235b5b91f25";
 
-const PAGE_SIZE     = 100;   // entries per list page
-const MAX_PER_RUN   = 200;   // safety cap so one run can't blast thousands (backlog drains over subsequent runs)
-const SEND_DELAY_MS = 150;   // gentle spacing between notification sends
+const PAGE_SIZE   = 100;    // entries per list page
+const MAX_PER_RUN = 800;    // drain up to this many per run (raised from 200 to clear backlog)
+const REQ_TIMEOUT = 10000;  // ms; abort any single request that stalls (prevents multi-min hangs)
 
 const ODS_BASE = "https://apis.roblox.com/ordered-data-stores/v1";
 
@@ -18,12 +18,17 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// fetch with a hard per-request timeout so one stalled call can't hang the whole run.
+function fetchWithTimeout(url, opts = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), REQ_TIMEOUT);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
+}
 
 // ---------------------------------------------------------------------------
 // List due entries. Ascending by value means due entries come first, so we can
 // stop the moment we hit one in the future. THROWS on any non-2xx so a bad
-// request (e.g. the old order_by=value 400) can never masquerade as "empty".
+// request can never masquerade as "empty".
 // ---------------------------------------------------------------------------
 async function fetchDueEntries(now) {
   const due = [];
@@ -34,10 +39,10 @@ async function fetchDueEntries(now) {
       `${ODS_BASE}/universes/${UNIVERSE_ID}/orderedDataStores/${ODS_NAME}/scopes/global/entries`
     );
     url.searchParams.set("max_page_size", String(PAGE_SIZE));
-    url.searchParams.set("order_by", "asc"); // <-- this endpoint wants asc/desc, NOT "value"
+    url.searchParams.set("order_by", "asc"); // this endpoint wants asc/desc, NOT "value"
     if (pageToken) url.searchParams.set("page_token", pageToken);
 
-    const res = await fetch(url, { headers: { "x-api-key": API_KEY } });
+    const res = await fetchWithTimeout(url, { headers: { "x-api-key": API_KEY } });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`List failed: HTTP ${res.status} ${body}`);
@@ -53,7 +58,7 @@ async function fetchDueEntries(now) {
       if (value <= now) {
         due.push(e); // { path, id, value }
       } else {
-        return due; // ascending order -> everything after this is in the future
+        return due;  // ascending -> everything after this is in the future
       }
       if (due.length >= MAX_PER_RUN) break;
     }
@@ -65,13 +70,11 @@ async function fetchDueEntries(now) {
   return due;
 }
 
-// ---------------------------------------------------------------------------
 // Send one notification. Returns "sent" | "skip" | "ratelimited".
-// The key id is "u<userId>" -> strip the "u" for the users/{id} endpoint.
-// ---------------------------------------------------------------------------
+// entry id is "u<userId>" -> strip the "u" for the users/{id} endpoint.
 async function sendNotification(entryId) {
   const userId = entryId.replace(/^u/, "");
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `https://apis.roblox.com/cloud/v2/users/${userId}/notifications`,
     {
       method: "POST",
@@ -86,7 +89,6 @@ async function sendNotification(entryId) {
   if (res.status === 429) return "ratelimited";
   if (!res.ok) {
     // 400/403/404 are expected for users who opted out / can't be prompted.
-    // Nothing to retry, so we still delete the queue entry afterwards.
     const body = await res.text();
     console.warn(`send ${userId}: HTTP ${res.status} ${body}`);
     return "skip";
@@ -96,7 +98,7 @@ async function sendNotification(entryId) {
 
 // entry.path is the full resource path the API handed us -> delete straight off it.
 async function deleteEntry(path) {
-  const res = await fetch(`${ODS_BASE}/${path}`, {
+  const res = await fetchWithTimeout(`${ODS_BASE}/${path}`, {
     method: "DELETE",
     headers: { "x-api-key": API_KEY },
   });
@@ -110,22 +112,19 @@ async function deleteEntry(path) {
 async function main() {
   const now = Math.floor(Date.now() / 1000); // Unix SECONDS (queue stores seconds)
   const due = await fetchDueEntries(now);
-  console.log(`Found ${due.length} due ent(y/ies) at ${now}`);
+  console.log(`Found ${due.length} due entr${due.length === 1 ? "y" : "ies"} at ${now}`);
 
   let sent = 0, skipped = 0;
   for (const e of due) {
     const result = await sendNotification(e.id);
 
     if (result === "ratelimited") {
-      // Back off: leave this entry (and the rest) for the next cron run.
-      console.warn("Rate limited -> stopping this run, entry left in queue for retry.");
+      console.warn("Rate limited -> stopping this run; remaining entries stay queued for retry.");
       break;
     }
 
     await deleteEntry(e.path); // sent or skip -> drain it either way
     if (result === "sent") sent++; else skipped++;
-
-    await sleep(SEND_DELAY_MS);
   }
 
   console.log(`Done. sent=${sent} skipped=${skipped} remaining_in_batch=${due.length - sent - skipped}`);
