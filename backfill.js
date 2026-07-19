@@ -67,7 +67,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function loadCheckpoint() {
 	if (RESTART || !fs.existsSync(CHECKPOINT_FILE)) return null;
-	try { return JSON.parse(fs.readFileSync(CHECKPOINT_FILE, "utf8")); } catch { return null; }
+	try {
+		const cp = JSON.parse(fs.readFileSync(CHECKPOINT_FILE, "utf8"));
+		// A completed scan writes {done:true} instead of deleting the file, because
+		// GitHub Actions caches can't be deleted from inside a run -- a deleted file
+		// just gets re-restored stale, freezing the scan at the finish line forever
+		// (every subsequent run "completes" in minutes without re-probing anyone).
+		// Seeing the done-marker means: start a genuinely fresh full scan.
+		if (cp && cp.done) return null;
+		return cp;
+	} catch { return null; }
 }
 function saveCheckpoint(state) {
 	fs.writeFileSync(CHECKPOINT_FILE, JSON.stringify(state));
@@ -227,7 +236,9 @@ async function main() {
 	} while (pageToken);
 
 	console.log(`Done. pages=${pages} scanned=${scanned} optedIn=${optedIn} notOptedIn=${notOptedIn}`);
-	if (fs.existsSync(CHECKPOINT_FILE)) fs.unlinkSync(CHECKPOINT_FILE); // clean up on successful completion
+	// Mark completion (do NOT just delete -- the Actions cache would re-restore the
+	// old checkpoint and freeze the scan). {done:true} tells the next run to restart.
+	saveCheckpoint({ done: true });
 
 	if (!WRITE) {
 		console.log(`\nDRY RUN complete — nothing was sent or written.`);
