@@ -151,13 +151,15 @@ async function upsert(entryId, value) {
 async function main() {
 	const startMs = Date.now();
 	const now = Math.floor(Date.now() / 1000);
-	// Schedule newcomers a FULL day out, not at the next boundary. The probe below
-	// IS their first notification (that is how opt-in gets discovered), so seeding
-	// them at the next midnight-UTC would double-notify anyone discovered shortly
-	// before it -- and those land on different UTC days, so Roblox's 1/day cap
-	// would not suppress the second. Matters now that this job runs at 20:30 UTC
-	// (only ~3.5h before the boundary) instead of the old 05:00.
-	const dueValue = nextBoundary(now + DAY_SECONDS);
+	// Seed newcomers due the NEXT day boundary (X+1), NOT a full day out. The whole
+	// point of this system is D1/D7 retention: a player who joins day X must get a
+	// notification on day X+1 (the next calendar day) to pull them back and count as
+	// D1-retained; the daily worker cycle then covers X+2..X+7 for D7. Seeding a full
+	// day out (nextBoundary(now + DAY_SECONDS) = X+2) would SKIP their D1 entirely --
+	// that was a mistake. The discovery probe below is a separate same-day (X) touch;
+	// it's the X+1 worker send that drives retention, so the extra touch is an
+	// acceptable one-time cost.
+	const dueValue = nextBoundary(now);
 	const notifBody = JSON.stringify({
 		source: { universe: `universes/${UNIVERSE_ID}` },
 		payload: { type: "MOMENT", messageId: MESSAGE_ID },
