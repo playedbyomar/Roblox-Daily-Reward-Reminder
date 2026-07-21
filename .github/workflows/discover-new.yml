@@ -2,7 +2,11 @@ name: New Player Discovery
 
 on:
   schedule:
-    - cron: "0 5 * * *"
+    # 20:30 UTC: this job's probe IS the new player's FIRST notification, so the
+    # run time IS the delivery time. At "0 5" that meant ~3:24-4:48am Eastern,
+    # because GitHub runs crons late (observed 2.4-2.8h drift). 20:30 lands it
+    # 4:30pm ET if punctual, ~7pm ET if drifted -- evening either way.
+    - cron: "30 20 * * *"
   workflow_dispatch: {}
 
 concurrency:

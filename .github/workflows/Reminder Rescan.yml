@@ -6,7 +6,9 @@ on:
     # time budget; running daily (not weekly) lets consecutive runs RESUME via the
     # cached checkpoint and converge on a full cycle within a couple of days,
     # instead of a weekly run that only ever chips off one 5h chunk.
-    - cron: "0 6 * * *"
+    # 4x/day. Each run resumes the prior checkpoint, so 4x5h = ~20h of probing/day
+    # covers the ~525k store in ~1.1 days instead of ~4.5 at once-daily.
+    - cron: "0 0,6,12,18 * * *"
   workflow_dispatch: {}   # manual "Run workflow" button for testing
 
 # Never let two rescans overlap -- they'd double the send rate and fight over the

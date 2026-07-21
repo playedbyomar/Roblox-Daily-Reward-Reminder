@@ -48,11 +48,18 @@ const DAY_SECONDS = 86400;
 const WRITE = process.argv.includes("--write");
 const SNAPSHOT_FILE = path.join(__dirname, "known-keys.txt");
 
-// Safety cap: probe at most this many NEW keys per run. A normal day's delta is
-// far below this; the cap only bites if something abnormal happens (e.g. the
-// snapshot was lost and a huge batch suddenly looks "new"). Deferred keys are
-// NOT added to the snapshot, so they're re-tried next run instead of dropped.
-const MAX_NEW_PROBE = parseInt(process.env.MAX_NEW_PROBE || "5000", 10);
+// Safety cap: probe at most this many NEW keys per run. Deferred keys are NOT
+// added to the snapshot, so they are re-tried next run instead of dropped.
+//
+// RAISED 5,000 -> 50,000 (2026-07-21). 5k was far too low: this game gains
+// ~10k new players/day, so the cap deferred ~5k MORE than it cleared each run
+// and the backlog grew without bound (observed: new=37,568 probed=5,000
+// deferred=32,568). Since ~15% of NEW keys are opted-in (vs 5.7% overall),
+// that stranded ~4,900 opted-in players who should have been getting pinged.
+// The cap was never the real constraint -- TIME is, bounded separately by
+// DISCOVER_MAX_MINUTES. At 60ms/probe, 50k probes = ~50min on top of the
+// ~84min list pass, comfortably inside the 300min budget.
+const MAX_NEW_PROBE = parseInt(process.env.MAX_NEW_PROBE || "50000", 10);
 
 // Wall-clock budget (minutes); 0 = unlimited (local). In CI set below the job
 // timeout so we save the snapshot + exit 0 gracefully (a timeout-kill would be a
@@ -144,7 +151,13 @@ async function upsert(entryId, value) {
 async function main() {
 	const startMs = Date.now();
 	const now = Math.floor(Date.now() / 1000);
-	const dueValue = nextBoundary(now);
+	// Schedule newcomers a FULL day out, not at the next boundary. The probe below
+	// IS their first notification (that is how opt-in gets discovered), so seeding
+	// them at the next midnight-UTC would double-notify anyone discovered shortly
+	// before it -- and those land on different UTC days, so Roblox's 1/day cap
+	// would not suppress the second. Matters now that this job runs at 20:30 UTC
+	// (only ~3.5h before the boundary) instead of the old 05:00.
+	const dueValue = nextBoundary(now + DAY_SECONDS);
 	const notifBody = JSON.stringify({
 		source: { universe: `universes/${UNIVERSE_ID}` },
 		payload: { type: "MOMENT", messageId: MESSAGE_ID },
