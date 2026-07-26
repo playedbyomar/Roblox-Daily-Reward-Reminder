@@ -49,15 +49,15 @@ const WRITE = process.argv.includes("--write");
 const SNAPSHOT_FILE = path.join(__dirname, "known-keys.txt");
 
 // Safety cap: probe at most this many NEW keys per run. Deferred keys are NOT
-// added to the snapshot, so they are re-tried next run instead of dropped.
+// added to the snapshot, so they're re-tried next run instead of dropped.
 //
 // RAISED 5,000 -> 50,000 (2026-07-21). 5k was far too low: this game gains
-// ~10k new players/day, so the cap deferred ~5k MORE than it cleared each run
-// and the backlog grew without bound (observed: new=37,568 probed=5,000
+// ~10k new players/day, so the cap deferred ~5k MORE than it cleared every run
+// and the backlog grew unboundedly (observed: new=37,568, probed=5,000,
 // deferred=32,568). Since ~15% of NEW keys are opted-in (vs 5.7% overall),
-// that stranded ~4,900 opted-in players who should have been getting pinged.
-// The cap was never the real constraint -- TIME is, bounded separately by
-// DISCOVER_MAX_MINUTES. At 60ms/probe, 50k probes = ~50min on top of the
+// that stranded ~4,900 opted-in players who should have been getting notified.
+// The cap was never the real constraint -- TIME is, and it's bounded separately
+// by DISCOVER_MAX_MINUTES. At 60ms/probe, 50k probes = ~50min on top of the
 // ~84min list pass, comfortably inside the 300min budget.
 const MAX_NEW_PROBE = parseInt(process.env.MAX_NEW_PROBE || "50000", 10);
 
@@ -151,15 +151,22 @@ async function upsert(entryId, value) {
 async function main() {
 	const startMs = Date.now();
 	const now = Math.floor(Date.now() / 1000);
-	// Seed newcomers due the NEXT day boundary (X+1), NOT a full day out. The whole
-	// point of this system is D1/D7 retention: a player who joins day X must get a
-	// notification on day X+1 (the next calendar day) to pull them back and count as
-	// D1-retained; the daily worker cycle then covers X+2..X+7 for D7. Seeding a full
-	// day out (nextBoundary(now + DAY_SECONDS) = X+2) would SKIP their D1 entirely --
-	// that was a mistake. The discovery probe below is a separate same-day (X) touch;
-	// it's the X+1 worker send that drives retention, so the extra touch is an
-	// acceptable one-time cost.
-	const dueValue = nextBoundary(now);
+	// Seed newcomers ~24.5h out -- NOT at the next midnight boundary.
+	//
+	// The goal is D1: a player who joins day X must get a notification on day X+1 to
+	// return and count as D1-retained. But the probe below IS a real notification
+	// (the only way to discover opt-in) and it lands on day X, consuming that
+	// player's ONE-per-day quota. This job runs ~20:30-23:00 UTC, so the next
+	// midnight boundary is only ~1-3.5h after the probe -- the X+1 send would hit
+	// RESOURCE_EXHAUSTED, get requeued, and their D1 would be MISSED entirely.
+	//
+	// probe + 24h30m clears the cap window while still landing on day X+1 (a 21:00
+	// probe -> 21:30 next day), so the D1 notification actually delivers. After that
+	// send the worker requeues them to the normal midnight boundary, so they rejoin
+	// the main daily cluster (one skipped day while the cap window clears, then
+	// steady daily -- D7 unaffected).
+	const CAP_BUFFER = 1800; // 30min past the 1-per-day window, so the send isn't capped
+	const dueValue = now + DAY_SECONDS + CAP_BUFFER;
 	const notifBody = JSON.stringify({
 		source: { universe: `universes/${UNIVERSE_ID}` },
 		payload: { type: "MOMENT", messageId: MESSAGE_ID },
