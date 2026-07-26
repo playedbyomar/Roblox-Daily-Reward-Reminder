@@ -56,6 +56,7 @@ const MAX_RUNTIME_MS = parseInt(process.env.BACKFILL_MAX_MINUTES || "0", 10) * 6
 const SEND_DELAY_MS  = 60;  // notification-send endpoint tolerated much higher throughput in testing
 const WRITE_DELAY_MS = 900; // queue-write endpoint's real limit is ~1/sec -- but we now only hit this for opted-in users
 const LIST_DELAY_MS  = 250;
+const QUEUE_LIST_DELAY_MS = 200; // ODS list endpoint 429s if paged too fast
 
 const DS_BASE   = "https://apis.roblox.com/cloud/v2";
 const ODS_BASE  = "https://apis.roblox.com/ordered-data-stores/v1";
@@ -97,6 +98,50 @@ async function fetchRetry(url, opts = {}, label = "req") {
 function nextBoundary(now) {
 	const offset = RESET_OFFSET_HOURS * 3600;
 	return (Math.floor((now - offset) / DAY_SECONDS) + 1) * DAY_SECONDS + offset;
+}
+
+// Load every key currently in ReminderQueue_v1 so the scan can SKIP users who are
+// already in the daily cycle.
+//
+// WHY (found 2026-07-26): probing a user sends them a REAL notification -- that is
+// the only way to discover opt-in -- and Roblox allows just ONE notification per
+// user per day. This rescan runs ~20h/day, so it was consuming queued users' daily
+// quota at random hours, and the worker's scheduled prime-time send then bounced
+// with RESOURCE_EXHAUSTED. Observed directly: a rescan ended 23:53 UTC, and the
+// worker's 00:04 UTC run logged `sent=17 dailyCap=183` -- it was trying to notify
+// people the rescan had just notified minutes earlier.
+//
+// Queued users never needed re-probing here: the worker already re-verifies each
+// of them daily and prunes the genuinely lapsed (glitch-safe). This rescan's only
+// unique job is finding opt-ins among users NOT yet in the queue.
+//
+// Best-effort: if the listing fails partway we proceed with whatever we collected
+// (skipping fewer users just restores some interference, it never loses anyone).
+async function loadQueueMembers() {
+	const members = new Set();
+	let pageToken = null, pages = 0;
+	while (pages < 5000) {
+		pages++;
+		const url = new URL(
+			`${ODS_BASE}/universes/${UNIVERSE_ID}/orderedDataStores/${ODS_NAME}/scopes/global/entries`
+		);
+		url.searchParams.set("max_page_size", "100");
+		url.searchParams.set("order_by", "asc");
+		if (pageToken) url.searchParams.set("page_token", pageToken);
+
+		const res = await fetchRetry(url, { headers: { "x-api-key": API_KEY } }, `queue p${pages}`);
+		if (!res.ok) {
+			console.warn(`queue list: HTTP ${res.status} at page ${pages}; continuing with ${members.size} loaded`);
+			break;
+		}
+		const data = await res.json();
+		const ents = data.entries || [];
+		for (const e of ents) if (e.id) members.add(e.id);
+		pageToken = data.nextPageToken;
+		if (!pageToken || ents.length === 0) break;
+		await sleep(QUEUE_LIST_DELAY_MS);
+	}
+	return members;
 }
 
 // Real send attempt -- the only way to discover opt-in status. Mirrors the
@@ -165,9 +210,15 @@ async function main() {
 	let scanned   = cp?.scanned ?? 0;
 	let optedIn   = cp?.optedIn ?? 0;
 	let notOptedIn = cp?.notOptedIn ?? 0;
+	let skippedQueued = cp?.skippedQueued ?? 0;
 
 	console.log(`${WRITE ? "WRITE (sends real notifications now)" : "DRY RUN"} — due value = ${dueValue}`);
 	if (cp) console.log(`Resuming from checkpoint: page ${pages}, ${scanned} scanned so far`);
+
+	// Users already in the daily cycle are skipped (see loadQueueMembers). Rebuilt
+	// each run -- it's ~1min for ~26k and keeps a resumed run correct.
+	const queued = WRITE ? await loadQueueMembers() : new Set();
+	if (WRITE) console.log(`Queue membership: ${queued.size} users already in the daily cycle -> will be skipped (not re-notified).`);
 
 	do {
 		const url = new URL(`${DS_BASE}/universes/${UNIVERSE_ID}/data-stores/${DAILY_STORE}/entries`);
@@ -198,6 +249,11 @@ async function main() {
 			scanned++;
 
 			if (WRITE) {
+				// Already in the daily cycle -> the worker owns them. Probing here would
+				// send a REAL notification and burn their 1-per-day quota, making the
+				// worker's scheduled send bounce (see loadQueueMembers).
+				if (queued.has(id)) { skippedQueued++; continue; }
+
 				const userId = id.slice(1); // strip leading "u"
 				const result = await sendNotification(userId, notifBody);
 
@@ -218,15 +274,15 @@ async function main() {
 		pageToken = data.nextPageToken;
 		pages++;
 		if (pages % 5 === 0) {
-			console.log(`...${pages} pages, ${scanned} scanned, ${optedIn} opted-in, ${notOptedIn} not opted-in`);
-			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn });
+			console.log(`...${pages} pages, ${scanned} scanned, ${optedIn} opted-in, ${notOptedIn} not opted-in, ${skippedQueued} skipped(already queued)`);
+			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued });
 		}
 
 		// Wall-clock budget: stop BEFORE the CI job timeout so we exit cleanly with
 		// an up-to-date checkpoint. Only bail when there's more to do (pageToken set)
 		// -- on the final page we'd rather just finish and clear the checkpoint below.
 		if (MAX_RUNTIME_MS && pageToken && Date.now() - startMs > MAX_RUNTIME_MS) {
-			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn });
+			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued });
 			const mins = Math.round((Date.now() - startMs) / 60000);
 			console.log(`Time budget reached (${mins} min). Saved checkpoint at page ${pages}, ${scanned} scanned. Exiting 0 to resume next run.`);
 			return; // graceful -> do NOT delete the checkpoint; the next run resumes here
@@ -235,7 +291,7 @@ async function main() {
 		if (pageToken) await sleep(LIST_DELAY_MS);
 	} while (pageToken);
 
-	console.log(`Done. pages=${pages} scanned=${scanned} optedIn=${optedIn} notOptedIn=${notOptedIn}`);
+	console.log(`Done. pages=${pages} scanned=${scanned} optedIn=${optedIn} notOptedIn=${notOptedIn} skippedQueued=${skippedQueued}`);
 	// Mark completion (do NOT just delete -- the Actions cache would re-restore the
 	// old checkpoint and freeze the scan). {done:true} tells the next run to restart.
 	saveCheckpoint({ done: true });
