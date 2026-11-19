@@ -1,0 +1,31 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows on a public repo after 60 days without
+# a commit. That silently turned off discovery + rescan on 2026-09-24 and
+# new players stopped being queued for ~8 weeks. Re-enabling a workflow via
+# the API resets its inactivity timer, so do it monthly for every scheduled
+# workflow that should stay on (including this one).
+# Deliberately NOT listed: reminder-check.yml (old GitHub sender, disabled on
+# purpose; Cloudflare sends now and the two would double-send).
+
+on:
+  schedule:
+    - cron: "17 9 1,15 * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-enable scheduled workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for wf in "Reminder Rescan.yml" discover-new.yml keepalive.yml; do
+            enc=$(printf '%s' "$wf" | sed 's/ /%20/g')
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$enc/enable"
+            echo "enabled $wf"
+          done
