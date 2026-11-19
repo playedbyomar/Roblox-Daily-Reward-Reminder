@@ -58,6 +58,17 @@ const WRITE_DELAY_MS = 900; // queue-write endpoint's real limit is ~1/sec -- bu
 const LIST_DELAY_MS  = 250;
 const QUEUE_LIST_DELAY_MS = 200; // ODS list endpoint 429s if paged too fast
 
+// ACTIVITY FILTER (2026-11-19). Every probe is a REAL notification, and ~95% of
+// the ~525k keys belong to players who left long ago. So before probing, READ the
+// player's DailyRewards_v2 entry (a read sends nothing) and skip anyone whose
+// last write (revisionCreateTime) is older than ACTIVE_WITHIN_DAYS. Matches the
+// worker's sunset: the worker drops players idle 30+ days, and this rescan is how
+// they get back in once they play again. Unknown last-active (read failed) ->
+// probe as before (fail-open), counted as `unknownActivity` so a missing API
+// permission shows up in the log instead of silently changing behaviour.
+const ACTIVE_WITHIN_DAYS = parseInt(process.env.ACTIVE_WITHIN_DAYS || "30", 10);
+const READ_CONC = 8; // parallel entry reads; fetchRetry backs off on 429
+
 const DS_BASE   = "https://apis.roblox.com/cloud/v2";
 const ODS_BASE  = "https://apis.roblox.com/ordered-data-stores/v1";
 const NOTIF_URL = (userId) => `https://apis.roblox.com/cloud/v2/users/${userId}/notifications`;
@@ -181,6 +192,21 @@ async function sendNotification(userId, notifBody) {
 	}
 }
 
+// Unix seconds of the player's last DailyRewards_v2 write, or null if unknown.
+async function lastActive(entryId) {
+	try {
+		const res = await fetchRetry(
+			`${DS_BASE}/universes/${UNIVERSE_ID}/data-stores/${DAILY_STORE}/entries/${entryId}`,
+			{ headers: { "x-api-key": API_KEY } },
+			`read ${entryId}`
+		);
+		if (!res.ok) return null;
+		const d = await res.json();
+		const t = Date.parse(d.revisionCreateTime || d.createTime || "");
+		return Number.isNaN(t) ? null : Math.floor(t / 1000);
+	} catch { return null; }
+}
+
 async function upsert(entryId, value) {
 	const res = await fetchRetry(
 		`${ODS_BASE}/universes/${UNIVERSE_ID}/orderedDataStores/${ODS_NAME}/scopes/global/entries/${entryId}?allow_missing=true`,
@@ -211,6 +237,8 @@ async function main() {
 	let optedIn   = cp?.optedIn ?? 0;
 	let notOptedIn = cp?.notOptedIn ?? 0;
 	let skippedQueued = cp?.skippedQueued ?? 0;
+	let skippedIdle = cp?.skippedIdle ?? 0;
+	let unknownActivity = cp?.unknownActivity ?? 0;
 
 	console.log(`${WRITE ? "WRITE (sends real notifications now)" : "DRY RUN"} — due value = ${dueValue}`);
 	if (cp) console.log(`Resuming from checkpoint: page ${pages}, ${scanned} scanned so far`);
@@ -242,18 +270,38 @@ async function main() {
 		const data = await res.json();
 		const entries = data.dataStoreEntries || data.entries || data.keys || [];
 
+		// Pass 1: ids on this page, minus those already in the daily cycle (the
+		// worker owns them; probing would burn their 1-per-day quota, see
+		// loadQueueMembers).
+		const candidates = [];
 		for (const e of entries) {
 			let id = typeof e === "string" ? e : (e.id || e.key || "");
 			id = id.split("/").pop(); // strip "global/" scope prefix
 			if (!/^u\d+$/.test(id)) continue;
 			scanned++;
+			if (!WRITE) continue;
+			if (queued.has(id)) { skippedQueued++; continue; }
+			candidates.push(id);
+		}
 
-			if (WRITE) {
-				// Already in the daily cycle -> the worker owns them. Probing here would
-				// send a REAL notification and burn their 1-per-day quota, making the
-				// worker's scheduled send bounce (see loadQueueMembers).
-				if (queued.has(id)) { skippedQueued++; continue; }
+		// Pass 2: activity filter (reads only, parallel). Long-gone players are
+		// skipped without a notification.
+		const toProbe = [];
+		const cutoff = Math.floor(Date.now() / 1000) - ACTIVE_WITHIN_DAYS * DAY_SECONDS;
+		for (let i = 0; i < candidates.length; i += READ_CONC) {
+			const batch = candidates.slice(i, i + READ_CONC);
+			const times = await Promise.all(batch.map(lastActive));
+			batch.forEach((id, k) => {
+				const t = times[k];
+				if (t === null) { unknownActivity++; toProbe.push(id); }
+				else if (t < cutoff) skippedIdle++;
+				else toProbe.push(id);
+			});
+		}
 
+		// Pass 3: probe the recently-active, sequentially as before.
+		for (const id of toProbe) {
+			{
 				const userId = id.slice(1); // strip leading "u"
 				const result = await sendNotification(userId, notifBody);
 
@@ -274,15 +322,15 @@ async function main() {
 		pageToken = data.nextPageToken;
 		pages++;
 		if (pages % 5 === 0) {
-			console.log(`...${pages} pages, ${scanned} scanned, ${optedIn} opted-in, ${notOptedIn} not opted-in, ${skippedQueued} skipped(already queued)`);
-			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued });
+			console.log(`...${pages} pages, ${scanned} scanned, ${optedIn} opted-in, ${notOptedIn} not opted-in, ${skippedQueued} skipped(already queued), ${skippedIdle} skipped(idle >${ACTIVE_WITHIN_DAYS}d), ${unknownActivity} unknown-activity`);
+			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued, skippedIdle, unknownActivity });
 		}
 
 		// Wall-clock budget: stop BEFORE the CI job timeout so we exit cleanly with
 		// an up-to-date checkpoint. Only bail when there's more to do (pageToken set)
 		// -- on the final page we'd rather just finish and clear the checkpoint below.
 		if (MAX_RUNTIME_MS && pageToken && Date.now() - startMs > MAX_RUNTIME_MS) {
-			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued });
+			saveCheckpoint({ pageToken, pages, scanned, optedIn, notOptedIn, skippedQueued, skippedIdle, unknownActivity });
 			const mins = Math.round((Date.now() - startMs) / 60000);
 			console.log(`Time budget reached (${mins} min). Saved checkpoint at page ${pages}, ${scanned} scanned. Exiting 0 to resume next run.`);
 			return; // graceful -> do NOT delete the checkpoint; the next run resumes here
@@ -291,7 +339,7 @@ async function main() {
 		if (pageToken) await sleep(LIST_DELAY_MS);
 	} while (pageToken);
 
-	console.log(`Done. pages=${pages} scanned=${scanned} optedIn=${optedIn} notOptedIn=${notOptedIn} skippedQueued=${skippedQueued}`);
+	console.log(`Done. pages=${pages} scanned=${scanned} optedIn=${optedIn} notOptedIn=${notOptedIn} skippedQueued=${skippedQueued} skippedIdle=${skippedIdle} unknownActivity=${unknownActivity}`);
 	// Mark completion (do NOT just delete -- the Actions cache would re-restore the
 	// old checkpoint and freeze the scan). {done:true} tells the next run to restart.
 	saveCheckpoint({ done: true });
