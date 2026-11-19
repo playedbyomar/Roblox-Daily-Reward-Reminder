@@ -13,13 +13,24 @@ on:
 
 # Never let two rescans overlap -- they'd double the send rate and fight over the
 # same checkpoint. A new scheduled run waits rather than starting concurrently.
-concurrency:
-  group: reminder-rescan
-  cancel-in-progress: false
+# One job per game; see the matrix below.
 
 jobs:
   rescan:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - game: penthouse
+            universe: "6033574667"
+            message: "7f7141f1-d906-504e-85f5-e235b5b91f25"
+          - game: penthouse-18plus
+            universe: "10777467285"
+            message: "2c75087e-3aa4-0943-bb37-c659c56c146f"
+    concurrency:
+      group: reminder-rescan-${{ matrix.universe }}
+      cancel-in-progress: false
     # Under GitHub's 6h hard cap. The script's BACKFILL_MAX_MINUTES (below) is set
     # lower still, so it exits gracefully on its own well before this fires -- this
     # is only a failsafe.
@@ -41,9 +52,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: backfill-progress.json
-          key: backfill-progress-${{ github.run_id }}
+          key: backfill-progress-${{ matrix.universe }}-${{ github.run_id }}
           restore-keys: |
-            backfill-progress-
+            backfill-progress-${{ matrix.universe }}-
 
       # NOTE: no --restart -- we WANT it to resume from the restored checkpoint.
       # BACKFILL_MAX_MINUTES makes the script save + exit 0 before the job timeout,
@@ -51,5 +62,7 @@ jobs:
       - name: Run backfill rescan (resumes from checkpoint)
         env:
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          UNIVERSE_ID: ${{ matrix.universe }}
+          MESSAGE_ID: ${{ matrix.message }}
           BACKFILL_MAX_MINUTES: "300"
         run: node backfill.js --write

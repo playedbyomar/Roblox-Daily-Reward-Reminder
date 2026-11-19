@@ -9,13 +9,24 @@ on:
     - cron: "30 20 * * *"
   workflow_dispatch: {}
 
-concurrency:
-  group: new-player-discovery
-  cancel-in-progress: false
-
+# One job per game (same scripts, different experience). Each game keeps its
+# own snapshot cache and its own concurrency lane.
 jobs:
   discover:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - game: penthouse
+            universe: "6033574667"
+            message: "7f7141f1-d906-504e-85f5-e235b5b91f25"
+          - game: penthouse-18plus
+            universe: "10777467285"
+            message: "2c75087e-3aa4-0943-bb37-c659c56c146f"
+    concurrency:
+      group: new-player-discovery-${{ matrix.universe }}
+      cancel-in-progress: false
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -26,11 +37,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: known-keys.txt
-          key: known-keys-${{ github.run_id }}
+          key: known-keys-${{ matrix.universe }}-${{ github.run_id }}
           restore-keys: |
-            known-keys-
+            known-keys-${{ matrix.universe }}-
       - name: Discover + seed new players
         env:
           ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          UNIVERSE_ID: ${{ matrix.universe }}
+          MESSAGE_ID: ${{ matrix.message }}
           DISCOVER_MAX_MINUTES: "300"
         run: node discover-new.js --write
